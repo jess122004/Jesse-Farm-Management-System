@@ -4,3 +4,4 @@ threading
 webbrowser
 gunicorn
 streamlit
+Python 3.11
