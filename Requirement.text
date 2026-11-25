@@ -1,7 +1,9 @@
-socket
- sys
-threading
-webbrowser
-gunicorn
 streamlit
-Python 3.11
+pandas
+numpy
+openpyxl
+statsmodels
+scipy
+arch
+matplotlib
+plotly
