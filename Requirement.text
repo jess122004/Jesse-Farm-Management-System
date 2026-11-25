@@ -3,3 +3,4 @@ socket
 threading
 webbrowser
 gunicorn
+streamlit
