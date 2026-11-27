@@ -18,7 +18,6 @@ import sys
 
 DATA_DIR = os.environ.get("JESSE_DATA", "/data")
 DB_FILE = os.path.join(DATA_DIR, "jesse_farm.db")
-os.environ["JESSE_DB"] = DB_FILE  # config.py reads this
 
 _ready = False
 
@@ -98,6 +97,7 @@ def start(core_path):
     exec(compile(head, core_path, "exec"), g)
     _patch(g["MODULES"])
 
+    os.environ["JESSE_DB"] = DB_FILE  # config.py reads this when it is imported just below
     os.makedirs(DATA_DIR, exist_ok=True)
     from jesse_farm import config, db, i18n, ui
     from jesse_farm.views import (animals, auth, breeding, dashboard, exports, farms, feeding, finance,  # noqa: F401
@@ -303,5 +303,14 @@ def _register_device_page():
     return device
 
 
-if __name__ == "__main__":  # quick manual check on a normal computer: python bridge.py jesse_core.py
-    print(start(sys.argv[1] if len(sys.argv) > 1 else "jesse_core.py"))
+def _run_streamlit_app():
+    """Streamlit Community Cloud was pointed at this file: run the Streamlit version (app.py) instead."""
+    import runpy
+    runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py"), run_name="__main__")
+
+
+if __name__ == "__main__":
+    if "streamlit" in sys.modules:   # started with "streamlit run bridge.py"
+        _run_streamlit_app()
+    else:                            # quick manual check on a normal computer: python bridge.py jesse_core.py
+        print(start(sys.argv[1] if len(sys.argv) > 1 else "jesse_core.py"))
