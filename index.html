@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JESSE FARM MANAGEMENT SYSTEM</title>
+<meta name="description" content="Livestock records, health, breeding and money for farms in Zambia and Rwanda. Runs entirely in your browser.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐄</text></svg>">
+<style>
+  :root{--g:#1f6f3a;--gd:#154d28;--side:#14261b;--m:#56625a}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#f3f5f4;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#17201a}
+  #frame{position:fixed;inset:0;width:100%;height:100%;border:0;display:none;background:#f3f5f4}
+  #boot{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--side);color:#cfe3d5;padding:24px}
+  #boot .box{max-width:440px;width:100%;text-align:center}
+  #boot h1{color:#fff;font-size:22px;line-height:1.25;letter-spacing:.3px;margin:0 0 6px}
+  #boot .sub{color:#9fc3aa;font-size:14px;margin-bottom:28px}
+  #boot .bar{height:6px;background:#1f3d2b;border-radius:3px;overflow:hidden}
+  #boot .bar div{height:100%;width:0;background:#7bd88f;transition:width .4s}
+  #boot .step{margin-top:12px;font-size:14px;min-height:20px}
+  #boot .err{margin-top:18px;background:#fdecec;color:#8b1c1c;border-radius:9px;padding:12px 14px;text-align:left;font-size:14px;display:none}
+  #boot .note{margin-top:28px;font-size:12.5px;color:#7f9c88}
+  #busy{position:fixed;top:0;left:0;right:0;height:3px;z-index:50;display:none;overflow:hidden}
+  #busy div{height:100%;width:30%;background:#7bd88f;animation:slide 1s linear infinite}
+  @keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(350%)}}
+  #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:60;max-width:min(560px,92vw);
+         background:#14261b;color:#fff;border-radius:10px;padding:12px 16px;font-size:14.5px;box-shadow:0 6px 24px rgba(0,0,0,.25);display:none}
+  #toast.bad{background:#8b1c1c}
+  .btn{display:inline-block;border:0;background:#7bd88f;color:#14261b;border-radius:9px;padding:10px 18px;font-size:15px;font-weight:700;cursor:pointer;margin-top:16px}
+</style>
+</head>
+<body>
+<div id="boot" role="status" aria-live="polite">
+  <div class="box">
+    <h1>JESSE FARM<br>MANAGEMENT SYSTEM</h1>
+    <div class="sub">Zambia · Rwanda</div>
+    <div class="bar"><div id="bootbar"></div></div>
+    <div class="step" id="bootstep">Starting…</div>
+    <div class="err" id="booterr"></div>
+    <div class="note">The first visit downloads Python for the browser (about 10 MB) and takes 5–15 seconds.
+      Your farm data stays on this device.</div>
+  </div>
+</div>
+<iframe id="frame" title="JESSE FARM MANAGEMENT SYSTEM"></iframe>
+<div id="busy"><div></div></div>
+<div id="toast" role="alert"></div>
+<input type="file" id="picker" accept=".db,.sqlite,.sqlite3,application/octet-stream" hidden>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide.js"></script>
+<script>
+"use strict";
+/*
+  How this page works
+  -------------------
+  1. Loads Pyodide (Python compiled to WebAssembly) and Python's sqlite3 module.
+  2. Mounts browser storage (IndexedDB) at /data, so the database survives closing the browser.
+  3. Runs bridge.py, which loads jesse_core.py unchanged.
+  4. Every link click or form submit inside the app is sent to bridge.handle() instead of a server;
+     the HTML it returns is shown in the frame. Redirects, cookies and downloads are handled here.
+*/
+const DATA = "/data";
+const COOKIE_KEY = "jesse.sid";
+const frame = document.getElementById("frame");
+let py = null, bridge = null, current = "/";
+
+// ------------------------------------------------------------------ small helpers
+function bootStep(text, pct) {
+  document.getElementById("bootstep").textContent = text;
+  document.getElementById("bootbar").style.width = pct + "%";
+}
+function bootError(html) {
+  const el = document.getElementById("booterr");
+  el.innerHTML = html;
+  el.style.display = "block";
+  document.getElementById("bootbar").style.background = "#e57373";
+}
+let toastTimer = null;
+function toast(text, bad = false) {
+  const t = document.getElementById("toast");
+  t.textContent = text;
+  t.className = bad ? "bad" : "";
+  t.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (t.style.display = "none"), bad ? 9000 : 6000);
+}
+function busy(on) { document.getElementById("busy").style.display = on ? "block" : "none"; }
+const nextFrame = () => new Promise(r => setTimeout(r, 20)); // let the busy bar paint before Python runs
+
+function getCookie() { try { return localStorage.getItem(COOKIE_KEY) || ""; } catch (e) { return window._sid || ""; } }
+function setCookie(header) {
+  // header looks like "sid=TOKEN; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600"
+  const value = header.split(";")[0].trim();
+  const clear = /Max-Age=0/i.test(header) || value === "sid=";
+  try { clear ? localStorage.removeItem(COOKIE_KEY) : localStorage.setItem(COOKIE_KEY, value); }
+  catch (e) { window._sid = clear ? "" : value; }
+}
+function clearCookie() { try { localStorage.removeItem(COOKIE_KEY); } catch (e) { window._sid = ""; } }
+
+// Save browser storage after every change. Calls are queued so two saves never overlap.
+let saving = Promise.resolve();
+function persist() {
+  saving = saving.then(() => new Promise(res => py.FS.syncfs(false, err => { if (err) console.error("save failed", err); res(); })));
+  return saving;
+}
+
+function download(b64, name, type) {
+  const bin = atob(b64), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([bytes], { type: type || "application/octet-stream" }));
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+}
+
+// ------------------------------------------------------------------ requests
+async function request(method, url, body = "", push = true) {
+  busy(true);
+  await nextFrame();
+  try {
+    for (let hops = 0; hops < 8; hops++) {
+      const r = JSON.parse(bridge.handle(method, url, body, getCookie(), current));
+      if (r.cookie) setCookie(r.cookie);
+      persist();
+      if (r.status === 303 && r.location) { method = "GET"; url = r.location; body = ""; continue; }
+      if (r.filename) { download(r.file_b64, r.filename, r.content_type); return; }
+      show(r.html, url, push);
+      return;
+    }
+    toast("Too many redirects.", true);
+  } catch (err) {
+    console.error(err);
+    toast("Something went wrong: " + (err.message || err).toString().split("\n").slice(-2).join(" "), true);
+  } finally {
+    busy(false);
+  }
+}
+function navigate(url, push = true) { return request("GET", url, "", push); }
+
+function show(html, url, push) {
+  current = url;
+  const hash = "#" + url;
+  if (push && location.hash !== hash) history.pushState(null, "", hash);
+  else if (!push) history.replaceState(null, "", hash);
+  frame.srcdoc = html;
+}
+
+// ------------------------------------------------------------------ wiring the pages inside the frame
+function submitForm(form, submitter) {
+  let fd;
+  try { fd = new FormData(form, submitter || undefined); } catch (e) { fd = new FormData(form); }
+  const params = new URLSearchParams();
+  for (const [k, v] of fd) if (typeof v === "string") params.append(k, v);
+  const method = (form.getAttribute("method") || "get").toUpperCase();
+  const action = form.getAttribute("action");
+  if (method === "GET") {
+    const base = (action || current).split("?")[0];
+    const qs = params.toString();
+    navigate(qs ? base + "?" + qs : base);
+  } else {
+    request("POST", action || current, params.toString());
+  }
+}
+
+frame.addEventListener("load", () => {
+  const w = frame.contentWindow, d = frame.contentDocument;
+  if (!d || !d.body) return;
+  document.title = d.title || "JESSE FARM MANAGEMENT SYSTEM";
+  // form.submit() (used by the farm switcher) skips the submit event, so route it here
+  w.HTMLFormElement.prototype.submit = function () { submitForm(this, null); };
+  d.addEventListener("click", e => {
+    const sh = e.target.closest && e.target.closest("[data-shell]");
+    if (sh) { e.preventDefault(); shellAction(sh.getAttribute("data-shell")); return; }
+    const a = e.target.closest && e.target.closest("a[href]");
+    if (!a || e.defaultPrevented) return;
+    const href = a.getAttribute("href");
+    if (href.startsWith("#")) {
+      e.preventDefault();
+      const target = d.getElementById(href.slice(1));
+      if (target) target.scrollIntoView({ behavior: "smooth" });
+    } else if (href.startsWith("/")) {
+      e.preventDefault();
+      navigate(href);              // pages inside the app, including "open in new tab" ones such as receipts
+    } else {
+      e.preventDefault();
+      window.open(a.href, "_blank", "noopener"); // outside links (laws, sources) open in a new tab
+    }
+  });
+  // middle-click / ctrl-click on an app link would open an empty page, so treat it as a normal click
+  d.addEventListener("auxclick", e => {
+    const a = e.target.closest && e.target.closest("a[href^='/']");
+    if (a) { e.preventDefault(); navigate(a.getAttribute("href")); }
+  });
+  // bubble phase: an onsubmit="return confirm(...)" that said No has already cancelled the event
+  d.addEventListener("submit", e => {
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    submitForm(e.target, e.submitter);
+  });
+});
+
+window.addEventListener("popstate", () => navigate(location.hash.slice(1) || "/", false));
+
+// ------------------------------------------------------------------ Backup & device page buttons
+const picker = document.getElementById("picker");
+picker.addEventListener("change", async () => {
+  const file = picker.files[0];
+  picker.value = "";
+  if (!file) return;
+  if (!confirm(`Replace the data on this device with "${file.name}"?\n\nYour current data is backed up first (Settings → Backup).`)) return;
+  busy(true);
+  await nextFrame();
+  try {
+    py.FS.writeFile("/tmp/upload.db", new Uint8Array(await file.arrayBuffer()));
+    const r = JSON.parse(bridge.import_db("/tmp/upload.db"));
+    await persist();
+    if (r.ok) { clearCookie(); toast(r.message); await navigate("/login"); }
+    else toast(r.message, true);
+  } catch (err) { console.error(err); toast("Could not restore that file.", true); }
+  finally { busy(false); }
+});
+
+async function shellAction(action) {
+  if (action === "import") { picker.click(); return; }
+  if (action === "erase" && !confirm("Erase ALL farms, accounts and backups stored in this browser?\n\nThis cannot be undone. Download a backup first if you may need the data.")) return;
+  busy(true);
+  await nextFrame();
+  try {
+    if (action === "export") {
+      const stamp = new Date().toISOString().slice(0, 10);
+      download(bridge.export_db(), `jesse-backup-${stamp}.db`);
+      toast("Backup downloaded. Keep it somewhere safe.");
+    } else if (action === "demo") {
+      bridge.load_demo();
+      await persist();
+      toast("Demonstration data loaded. Sign in with demo@jesse.farm / demo1234");
+      await navigate("/login");
+    } else if (action === "erase") {
+      bridge.erase_all();
+      clearCookie();
+      await persist();
+      toast("All data on this device was erased.");
+      await navigate("/device");
+    }
+  } catch (err) { console.error(err); toast("Something went wrong: " + err.message, true); }
+  finally { busy(false); }
+}
+
+// ------------------------------------------------------------------ start
+async function boot() {
+  try {
+    if (typeof loadPyodide !== "function") throw new Error("offline");
+    bootStep("Loading Python…", 10);
+    py = await loadPyodide();
+    bootStep("Loading the database engine…", 55);
+    await py.loadPackage("sqlite3");
+    try { await py.loadPackage("hashlib"); } catch (e) { /* bridge.py has a built-in fallback */ }
+    bootStep("Opening your farm data…", 70);
+    py.FS.mkdirTree(DATA);
+    py.FS.mount(py.FS.filesystems.IDBFS, {}, DATA);
+    await new Promise((res, rej) => py.FS.syncfs(true, err => (err ? rej(err) : res())));
+    bootStep("Starting JESSE FMS…", 85);
+    py.FS.mkdirTree("/app");
+    for (const name of ["jesse_core.py", "bridge.py"]) {
+      const resp = await fetch(name, { cache: "no-cache" });
+      if (!resp.ok) throw new Error(`Could not download ${name} (${resp.status})`);
+      py.FS.writeFile("/app/" + name, await resp.text());
+    }
+    py.runPython("import sys; sys.path.insert(0, '/app')");
+    bridge = py.pyimport("bridge");
+    const st = JSON.parse(bridge.start("/app/jesse_core.py"));
+    await persist();
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+    bootStep("Ready", 100);
+    const start = location.hash.slice(1);
+    await navigate(st.users === 0 && !start ? "/device" : (start || "/"), false);
+    document.getElementById("boot").style.display = "none";
+    frame.style.display = "block";
+  } catch (err) {
+    console.error(err);
+    if (String(err.message) === "offline") {
+      bootError("<b>Python could not be downloaded.</b> The first visit needs an internet connection. " +
+                "Check the connection and reload the page.");
+    } else {
+      bootError("<b>JESSE FMS could not start.</b><br>" + String(err.message || err).replace(/</g, "&lt;").split("\n").slice(-3).join("<br>") +
+                "<br><br>Try reloading. If it keeps happening, use a recent Chrome, Edge, Firefox or Safari.");
+    }
+  }
+}
+
+// Only one tab may use the database at a time, or two tabs could overwrite each other's changes.
+if (navigator.locks && navigator.locks.request) {
+  navigator.locks.request("jesse-fms-database", { ifAvailable: true }, lock => {
+    if (!lock) {
+      bootStep("Already open in another tab", 100);
+      bootError("<b>JESSE FMS is already open in another tab or window.</b> Use that one, or close it and reload this page. " +
+                "(Two open copies could overwrite each other's changes.)");
+      return;
+    }
+    boot();
+    return new Promise(() => {}); // keep the lock while this tab is open
+  });
+} else {
+  boot();
+}
+</script>
+</body>
+</html>

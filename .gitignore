@@ -1,0 +1,6 @@
+# Never publish databases: they hold farm records, emails and password hashes.
+*.db
+*.db-wal
+*.db-shm
+backups/
+__pycache__/
