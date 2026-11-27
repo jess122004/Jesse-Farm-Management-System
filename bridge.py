@@ -306,6 +306,13 @@ def _register_device_page():
 def _run_streamlit_app():
     """Streamlit Community Cloud was pointed at this file: run the Streamlit version (app.py) instead."""
     import runpy
+    # An earlier run of this file in the same process may have pointed the database at the browser-only
+    # folder; Streamlit keeps the process (and imported modules) between reruns, so undo that here.
+    if os.environ.get("JESSE_DB") == DB_FILE:
+        del os.environ["JESSE_DB"]
+    cfg = sys.modules.get("jesse_farm.config")
+    if cfg is not None and cfg.DB_PATH == DB_FILE:
+        cfg.DB_PATH = os.path.join(cfg.BASE_DIR, "jesse_farm.db")
     runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py"), run_name="__main__")
 
 
